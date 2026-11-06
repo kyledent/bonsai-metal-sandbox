@@ -259,7 +259,8 @@ cmd_up() {
         # shellcheck disable=SC2206  # split into words on purpose
         args+=(${BONSAI_SERVER_ARGS:-})
         server_sandbox
-        nohup "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1 < /dev/null &
+        # From its own folder: ggml lists the current one for backends, and the sandbox refuses this repository's
+        ( cd "$LLAMA_DIR" && exec nohup "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1 < /dev/null ) &
         echo $! > "$PID_FILE"
         echo "$PRESET-$QUANT" > "$MODEL_MARKER"
         echo "Starting the $PRESET server on port $PORT (log: $LOG_FILE)"
@@ -405,6 +406,7 @@ cmd_doctor() {
     trap "rm -f '$canary' '$state_canary' '$denied' '$probe'" EXIT
 
     server_sandbox
+    cd "$LLAMA_DIR"   # as ./bonsai up runs it; every path below is absolute
     echo "Server sandbox"
     expect_ok "llama-server sees Metal without a sandbox" lists_metal "$LLAMA_SERVER"
     expect_ok "llama-server sees Metal in the sandbox" lists_metal "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER"

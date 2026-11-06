@@ -61,6 +61,7 @@ while [ \$# -gt 0 ]; do
     esac
 done
 echo \"exec \$*\" >> \"\$log\"
+echo \"cwd \$(pwd -P)\" >> \"\$log\"
 exec \"\$@\""
 stub ps "tr '\\0' ' ' < /proc/\$2/cmdline 2>/dev/null; echo llama-server"
 # The agent's PATH holds jq's folder, so these two reach it wherever this machine keeps them (jq.exe: without its CRs)
@@ -85,6 +86,7 @@ check "./bonsai up starts the server" ./bonsai up
 contains() { grep -q -- "$2" "$1"; }
 check "server runs under its profile" contains "$WORK/sandbox.log" 'profile .*sandbox/server.sb'
 check "server gets its port as a parameter" contains "$WORK/sandbox.log" "param PORT=$PORT"
+check "server starts in its own folder, not this repository" contains "$WORK/sandbox.log" "^cwd .*/.runtime/llama/"
 # 32 GB: the 32K tier, a 2K budget for requests without one, and an 8 GiB prompt cache
 check "server command has the Prism flags" contains "$WORK/sandbox.log" \
     "exec .*llama-server -m .*PQ2_0.gguf --host 127.0.0.1 --port $PORT --alias bonsai2-27b-pq2-0 -ngl 99 -fa on -c 32768 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --jinja --reasoning-format deepseek --reasoning-budget 2048 --parallel 1 --cache-ram 8192"
