@@ -53,6 +53,7 @@ cd <this repository>
 ./bonsai setup     # download the runtime, the model and pi, and verify their checksums
 ./bonsai up        # start the server
 ./bonsai doctor    # check that the sandboxes allow and refuse what they should
+./bonsai check     # check that the server serves pi correctly
 ./bonsai           # open pi
 ```
 
@@ -70,6 +71,8 @@ Put your projects in `./workspace`, or set `WORKSPACE_DIR` in `.env`. The agent 
 | `./bonsai detect` | List the Bonsai servers that the agent can see |
 | `./bonsai shell` | Open a shell in the agent's sandbox |
 | `./bonsai doctor` | Test the sandboxes |
+| `./bonsai check` | Test that the server serves pi correctly: thinking, tool calls, long prompts, overflow and compaction |
+| `./bonsai bench` | Measure prefill and generation speed |
 
 ## Documentation
 
@@ -78,6 +81,7 @@ Put your projects in `./workspace`, or set `WORKSPACE_DIR` in `.env`. The agent 
 - [pi integration](docs/pi-integration.md): model detection, thinking levels and auto-compaction
 - [Sandbox](docs/sandbox.md): what each sandbox allows, and its limits
 - [Hardening](docs/hardening.md): known gaps, and how to tighten the setup further
+- [Checks and benchmarks](docs/checks.md): testing the running server, and measuring its speed
 - [Troubleshooting](docs/troubleshooting.md): failed checks, memory and empty answers
 
 ## Tests

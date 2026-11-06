@@ -139,5 +139,6 @@ HTTP 500, and earlier reasoning is not sent back, which otherwise defeats the pr
 - `off` and the default level on the 9B: a budget and no effort, and `enable_thinking` set to false when off.
 - Auto-compaction: a summary request follows when the server reports a full context, with the expected output limit.
 
-The real model has not been part of these tests, so the mock cannot show how well it thinks or summarizes. The retry after
-an overflow comes from reading pi's source, and has not been run against the fork's error message.
+The real model has not been part of these tests, so the mock cannot show how well it thinks or summarizes. On your Mac,
+`./bonsai check` tests the real server: the thinking budget, the overflow error that pi's retry depends on, and a summary
+request like pi's. See [Checks and benchmarks](checks.md).

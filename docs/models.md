@@ -86,7 +86,8 @@ macOS also limits how much memory the GPU may use, to less than the whole of the
 ## What is not known yet
 
 - **Speed on a Mac.** Prism publishes Apple Silicon figures for the 27B only: 18 tokens/s on an M4 Pro to 47 on an M5 Max.
-  The smaller models should be faster, but there are no published numbers.
+  The smaller models should be faster, but there are no published numbers. `./bonsai bench` measures your Mac: see
+  [Checks and benchmarks](checks.md).
 - **How they do as coding agents.** Their templates support tool calls, and the agent has been tested with a mock server
   only. Prism's agent demo uses the 27B. Expect less from a smaller model on larger tasks.
 

@@ -25,6 +25,7 @@ After changing a server setting, run `./bonsai restart`.
 | `BONSAI_API_KEY` | generated | Key for the server's API. If empty, one is generated on first run and kept in `.state/api-key`. The agent can read it. Other programs need it too: `curl -H "Authorization: Bearer $(cat .state/api-key)" ...` |
 | `BONSAI_SERVER_ARGS` | none | More `llama-server` arguments, split on spaces |
 | `BONSAI_START_TIMEOUT` | `300` | Seconds to wait for the server to load |
+| `BONSAI_CHECK_TIMEOUT` | `900` | Seconds to wait for each request of `./bonsai check` and `bench` |
 
 The context by RAM follows Bonsai-demo: 8K up to 11 GB, 16K up to 23 GB, 32K up to 35 GB, 64K up to 71 GB, and above that
 128K on the 27B and 64K on the others.
@@ -53,6 +54,7 @@ Nothing below is committed. All of it is listed in `.gitignore`.
 | `.state/api-key` | The server's generated API key |
 | `.state/home/` | The agent's home: pi's settings, sessions and whatever it installs |
 | `.state/server.log` | The server's log |
+| `.state/bench.jsonl` | Results of `./bonsai bench` |
 | `workspace/` | Your projects |
 
 To start again, stop the server and delete `.state`. To upgrade the runtime, change the pinned release and its checksum

@@ -482,6 +482,204 @@ cmd_doctor() {
     echo "All checks passed."
 }
 
+# --- Serving checks and benchmarks: requests to the running server, from outside the sandboxes, as pi would send them
+
+# Sets SERVED, SERVED_CTX and EFFORTS from the running server, and the folder for request files
+serving_ready() {
+    local props
+    server_healthy || die "no server answers on port $PORT: start it with ./bonsai up"
+    props=$(curl -fsS -m 10 -H "Authorization: Bearer $BONSAI_API_KEY" "$BASE_URL/props" 2>/dev/null) \
+        || die "the server refused the API key: restart it with ./bonsai restart"
+    SERVED=$(jq -r '.model_alias // "unknown"' <<<"$props")
+    SERVED_CTX=$(jq -r '.default_generation_settings.n_ctx // 0' <<<"$props")
+    case "$(echo "$SERVED" | tr 'A-Z' 'a-z')" in *27b*) EFFORTS=true ;; *) EFFORTS=false ;; esac
+    CHECK_DIR="$STATE/serve-check"
+    mkdir -p "$CHECK_DIR"
+    echo "Server on port $PORT: $SERVED, context $SERVED_CTX. Requests queue behind pi's, so leave it idle."
+}
+
+# request PATH BODY_FILE: sets RESP to the response's body and CODE to its HTTP status (000 when there was none)
+request() {
+    local out
+    out=$(curl -sS -m "${BONSAI_CHECK_TIMEOUT:-900}" -X POST -H "Authorization: Bearer $BONSAI_API_KEY" \
+        -H 'Content-Type: application/json' --data-binary "@$2" -w '\n%{http_code}' "$BASE_URL$1" 2>/dev/null) \
+        || out=$'\n000'
+    CODE=${out##*$'\n'}
+    RESP=${out%$'\n'*}
+}
+
+error_text() { jq -r '.error.message // .' <<<"$RESP" 2>/dev/null | head -c 200 || echo "HTTP $CODE"; }
+
+# count_tokens < TEXT: the server's own count
+count_tokens() {
+    jq -Rs '{content: .}' > "$CHECK_DIR/tokenize.json"
+    request /tokenize "$CHECK_DIR/tokenize.json"
+    jq '.tokens | length' <<<"$RESP" 2>/dev/null || echo 0
+}
+
+filler_lines() {
+    awk -v n="$1" 'BEGIN { for (i = 1; i <= n; i++)
+        printf "Note %d: the server reads this line as part of a long prompt, and nothing in it needs an answer.\n", i }'
+}
+
+# filler TOKENS FILE: about that many tokens, after a nonce so that no cached prompt matches
+filler() {
+    if [ -z "${LINE_TOKENS20:-}" ]; then
+        LINE_TOKENS20=$(filler_lines 20 | count_tokens)
+        [ "$LINE_TOKENS20" -gt 0 ] || die "the server's /tokenize did not answer: $(error_text)"
+    fi
+    { echo "Run $RANDOM$RANDOM."; filler_lines $(( $1 * 20 / LINE_TOKENS20 )); } > "$2"
+}
+
+# chat_body PROMPT_FILE MAX_TOKENS THINKING [EXTRA_JSON]: a request as pi sends it. Thinking off as the extension sends
+# it: no thinking, and the model card's sampling for that mode.
+chat_body() {
+    local extra=${4:-}
+    [ -n "$extra" ] || extra='{}'
+    jq -n --rawfile p "$1" --argjson max "$2" --argjson think "$3" --argjson efforts "$EFFORTS" --argjson extra "$extra" '
+        {model: "bonsai", messages: [{role: "user", content: $p}], max_tokens: $max, stream: false,
+         cache_prompt: false}
+        + (if $think then {chat_template_kwargs: {enable_thinking: true}}
+           else {chat_template_kwargs: {enable_thinking: false}, temperature: 0.7, top_p: 0.8, top_k: 20, min_p: 0,
+                 presence_penalty: 1.5} + (if $efforts then {reasoning_effort: "none"} else {} end) end)
+        + $extra'
+}
+
+# chat PROMPT_FILE MAX_TOKENS THINKING [EXTRA_JSON]
+chat() {
+    chat_body "$@" > "$CHECK_DIR/request.json"
+    request /v1/chat/completions "$CHECK_DIR/request.json"
+}
+
+# What a response's timings say about reading the prompt
+prefill_text() {
+    jq -r '.timings | "\(.prompt_n) tokens read in \(.prompt_ms / 100 | round / 10) s, \(.prompt_per_second | round) tokens/s"' \
+        <<<"$RESP" 2>/dev/null || echo "no timings"
+}
+
+CHECK_FAILS=0
+CHECK_WARNS=0
+verdict() { # ok|FAIL|warn, label, detail
+    printf '  %-5s %s%s\n' "$1" "$2" "${3:+  ($3)}"
+    case "$1" in
+        FAIL) CHECK_FAILS=$(( CHECK_FAILS + 1 )) ;;
+        warn) CHECK_WARNS=$(( CHECK_WARNS + 1 )) ;;
+    esac
+}
+
+cmd_check() {
+    serving_ready
+    local f="$CHECK_DIR/prompt.txt" started=$SECONDS n target reserve maxout budget thought
+    echo "Each check waits for the model; the last three read long prompts, and can take minutes on a small Mac."
+
+    echo 'Reply with the single word: ready' > "$f"
+    chat "$f" 64 false
+    if [ "$CODE" != 200 ]; then verdict FAIL "it answers with thinking off" "$(error_text)"
+    elif jq -e '(.choices[0].message.content // "" | length > 0) and (.choices[0].message.reasoning_content // "" | length == 0)' <<<"$RESP" >/dev/null
+    then verdict ok "it answers with thinking off"
+    else verdict FAIL "it answers with thinking off" "empty answer, or it thought anyway"; fi
+
+    # The extension's budgets rely on the fork's thinking_budget_tokens
+    budget=256
+    echo 'In one sentence: why is the sky blue?' > "$f"
+    chat "$f" 2048 true "$(jq -n --argjson b "$budget" --argjson efforts "$EFFORTS" \
+        '{thinking_budget_tokens: $b} + (if $efforts then {reasoning_effort: "medium"} else {} end)')"
+    if [ "$CODE" != 200 ]; then verdict FAIL "thinking stays within its budget" "$(error_text)"
+    else
+        thought=$(jq -r '.choices[0].message.reasoning_content // ""' <<<"$RESP" | count_tokens)
+        if ! jq -e '.choices[0].message.content // "" | length > 0' <<<"$RESP" >/dev/null; then
+            verdict FAIL "thinking stays within its budget" "no answer after $thought tokens of thinking"
+        elif [ "$thought" -le $(( budget + budget / 10 + 32 )) ]; then
+            verdict ok "thinking stays within its budget" "$thought of $budget tokens"
+        else
+            verdict FAIL "thinking stays within its budget" "$thought tokens for a budget of $budget"
+        fi
+    fi
+
+    # Prism lists malformed tool calls as a known issue of the model, so a miss is a warning
+    echo 'Read the file notes.txt in the current folder.' > "$f"
+    chat "$f" 512 false '{"tools": [{"type": "function", "function": {"name": "read_file",
+        "description": "Read a text file", "parameters": {"type": "object",
+        "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]}'
+    if [ "$CODE" != 200 ]; then verdict FAIL "a tool call is well formed" "$(error_text)"
+    elif jq -e '.choices[0].message.tool_calls[0].function | .name == "read_file"
+                and (.arguments | fromjson | .path | type == "string")' <<<"$RESP" >/dev/null 2>&1
+    then verdict ok "a tool call is well formed"
+    else verdict warn "a tool call is well formed" "no valid read_file call: a known issue of the model"; fi
+
+    target=$(( SERVED_CTX * 85 / 100 ))
+    filler "$target" "$f"
+    chat "$f" 16 false
+    if [ "$CODE" != 200 ]; then verdict FAIL "it reads a prompt of 85% of the context" "$(error_text)"
+    else
+        n=$(jq '.timings.prompt_n // 0' <<<"$RESP")
+        if [ "$n" -ge $(( target * 8 / 10 )) ]; then verdict ok "it reads a prompt of 85% of the context" "$(prefill_text)"
+        else verdict FAIL "it reads a prompt of 85% of the context" "only $n tokens read"; fi
+    fi
+
+    # pi compacts and retries once when a request overflows, if the error matches its pattern for llama.cpp
+    filler $(( SERVED_CTX + 256 )) "$f"
+    chat "$f" 16 false
+    if [ "$CODE" = 200 ]; then verdict FAIL "an overflow is reported in the words pi recognizes" "a longer prompt than the context was accepted"
+    elif jq -e '.error.message // "" | test("exceeds the available context size"; "i")' <<<"$RESP" >/dev/null 2>&1
+    then verdict ok "an overflow is reported in the words pi recognizes" "HTTP $CODE"
+    else verdict FAIL "an overflow is reported in the words pi recognizes" "HTTP $CODE: $(error_text)"; fi
+
+    # As pi asks for a summary: past the extension, so the server's default budget and effort, with 80% of the reserve as
+    # its output limit, after a conversation that fills the context up to the reserve
+    reserve=$(( SERVED_CTX / 4 )); [ "$reserve" -le 24576 ] || reserve=24576
+    maxout=$(( reserve * 8 / 10 ))
+    filler $(( SERVED_CTX - reserve - 512 )) "$f"
+    printf '\nSummarize the notes above for a colleague who will continue the work: what they are, and what is left to do.\n' >> "$f"
+    chat "$f" "$maxout" true
+    if [ "$CODE" != 200 ]; then verdict FAIL "a compaction summary fits its output limit" "$(error_text)"
+    else
+        thought=$(jq -r '.choices[0].message.reasoning_content // ""' <<<"$RESP" | count_tokens)
+        if jq -e '.choices[0].finish_reason == "stop" and (.choices[0].message.content // "" | length > 0)' <<<"$RESP" >/dev/null
+        then verdict ok "a compaction summary fits its output limit" "$thought tokens of thinking, limit $maxout; $(prefill_text)"
+        elif jq -e '.choices[0].finish_reason == "length"' <<<"$RESP" >/dev/null
+        then verdict FAIL "a compaction summary fits its output limit" "cut off at $maxout tokens, $thought of them thinking: lower BONSAI_REASONING_BUDGET"
+        else verdict FAIL "a compaction summary fits its output limit" "an empty summary"; fi
+    fi
+
+    echo
+    echo "$CHECK_FAILS failed, $CHECK_WARNS warning(s), in $(( SECONDS - started )) s."
+    [ "$CHECK_FAILS" = 0 ]
+}
+
+cmd_bench() {
+    local sizes=${*:-512 2048 8192} gen=128 size f row machine n pps first gps gen_n
+    for size in $sizes; do case "$size" in *[!0-9]*|'') die "bench takes prompt sizes in tokens, not $size" ;; esac; done
+    serving_ready
+    f="$CHECK_DIR/prompt.txt"
+    machine=$(jq -cn --arg model "$(sysctl -n hw.model 2>/dev/null || echo unknown)" \
+        --arg chip "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)" \
+        --arg macos "$(sw_vers -productVersion 2>/dev/null || echo unknown)" --argjson ram "$(mem_gb)" \
+        '{mac: $model, chip: $chip, macos: $macos, ram_gb: $ram}')
+    # The first request after a start also compiles Metal's kernels
+    echo 'Reply with the single word: ready' > "$f"
+    chat "$f" 8 false
+    [ "$CODE" = 200 ] || die "the warm-up request failed: $(error_text)"
+    printf '  %-8s %-16s %-13s %s\n' PROMPT 'PREFILL' 'FIRST TOKEN' 'GENERATION'
+    for size in $sizes; do
+        if [ $(( size + gen + 256 )) -gt "$SERVED_CTX" ]; then
+            echo "  skip     $size tokens do not fit the context ($SERVED_CTX)"; continue
+        fi
+        filler "$size" "$f"
+        chat "$f" "$gen" false '{"ignore_eos": true}'
+        [ "$CODE" = 200 ] || die "the request of $size tokens failed: $(error_text)"
+        row=$(jq -r '.timings | [.prompt_n, (.prompt_per_second | round), (.prompt_ms / 100 | round / 10),
+            (.predicted_per_second * 10 | round / 10), .predicted_n] | @tsv' <<<"$RESP")
+        IFS=$'\t' read -r n pps first gps gen_n <<<"$row"
+        printf '  %-8s %-16s %-13s %s\n' "$n" "$pps tokens/s" "$first s" "$gps tokens/s ($gen_n tokens)"
+        jq -c --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg served "$SERVED" --argjson ctx "$SERVED_CTX" \
+            --argjson machine "$machine" '{date: $date, model: $served, ctx: $ctx} + $machine + (.timings | {
+                prompt_tokens: .prompt_n, prefill_tps: .prompt_per_second, first_token_ms: .prompt_ms,
+                generated_tokens: .predicted_n, generation_tps: .predicted_per_second})' <<<"$RESP" >> "$STATE/bench.jsonl"
+    done
+    echo "Results added to $STATE/bench.jsonl"
+}
+
 usage() {
     cat <<'EOF'
 Usage: ./bonsai [command]
@@ -496,6 +694,8 @@ Usage: ./bonsai [command]
   logs      follow the server's log
   status    what is running
   doctor    check that the sandboxes allow and refuse what they should
+  check     check that the running server serves pi correctly: thinking, tool calls, long prompts, overflow, compaction
+  bench     measure prefill and generation speed; prompt sizes in tokens may follow (default 512 2048 8192)
 EOF
 }
 
@@ -503,7 +703,7 @@ command=${1:-pi}
 [ $# -eq 0 ] || shift
 case "$command" in
     -h|--help|help) usage; exit 0 ;;
-    pi|setup|models|up|down|restart|detect|shell|logs|status|doctor) ;;
+    pi|setup|models|up|down|restart|detect|shell|logs|status|doctor|check|bench) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -520,4 +720,6 @@ case "$command" in
     logs)    tail -n 200 -f "$LOG_FILE" ;;
     status)  cmd_status ;;
     doctor)  cmd_doctor ;;
+    check)   cmd_check ;;
+    bench)   cmd_bench "$@" ;;
 esac

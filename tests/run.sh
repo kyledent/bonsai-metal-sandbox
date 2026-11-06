@@ -199,6 +199,22 @@ check "9B on 128 GB: the top tier is the 27B's only" contains "$WORK/sandbox.log
 check "restart the 27B on 128 GB" env BONSAI_MODEL=27B ./bonsai restart
 check "27B on 128 GB: the top tier" contains "$WORK/sandbox.log" 'exec .* -c 131072 '
 
+# --- Serving checks and benchmarks, against the mock's timings and errors (a 128K context here)
+check "./bonsai check passes" sh -c './bonsai check > "$0/check.out"' "$WORK"
+check "check: all six ran" sh -c 'test "$(grep -c "^  ok " "$0/check.out")" -eq 6' "$WORK"
+check "check: the budget is kept" contains "$WORK/check.out" "ok    thinking stays within its budget  (256 of 256 tokens)"
+check "check: the summary's limit is 80% of the reserve" contains "$WORK/check.out" "limit 19660"
+check "./bonsai bench measures each size" sh -c './bonsai bench 512 2048 > "$0/bench.out"' "$WORK"
+check "bench: a row per size" sh -c 'test "$(grep -cE "^  [0-9]+ +500 tokens/s +[0-9.]+ s +20 tokens/s \(128 tokens\)" "$0/bench.out")" -eq 2' "$WORK"
+check "bench: results kept, with the model and speeds" sh -c \
+    "jq -es 'length == 2 and all(.model == \"bonsai2-27b-pq2-0\" and .prefill_tps == 500 and .generation_tps == 20 and .generated_tokens == 128)' .state/bench.jsonl >/dev/null"
+check "bench refuses a size that is not a number" sh -c '! ./bonsai bench lots 2>/dev/null'
+BONSAI_SERVER_ARGS="--overflow-text=context-too-long --think-tokens=30000" ./bonsai restart >/dev/null
+check "check fails when pi would miss an overflow, or a summary is cut off" sh -c '! ./bonsai check > "$0/check.out"' "$WORK"
+check "check: names the overflow" contains "$WORK/check.out" "FAIL  an overflow is reported in the words pi recognizes"
+check "check: names the cut-off summary" contains "$WORK/check.out" "FAIL  a compaction summary fits its output limit  (cut off"
+./bonsai restart >/dev/null
+
 # --- One of ours whose pid file is gone: found by its port
 ORPHAN=$(cat .state/server.pid)
 rm -f .state/server.pid .state/server.model
