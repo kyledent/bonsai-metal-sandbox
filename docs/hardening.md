@@ -29,7 +29,6 @@ These need no code changes. In `.env`:
 ```sh
 BONSAI_AGENT_NETWORK=server
 BONSAI_PORTS=8080
-BONSAI_API_KEY=<a long random value>
 BONSAI_SERVER_ARGS=--no-webui --no-slots
 ```
 
@@ -37,8 +36,8 @@ BONSAI_SERVER_ARGS=--no-webui --no-slots
   when you need it.
 - **`BONSAI_PORTS=8080`** narrows the agent's access to one port. By default it can reach 8080-8083, including anything
   else you run on those ports.
-- **`BONSAI_API_KEY`** stops other local processes and web pages from using the model. The agent can still read the key.
-  The server's `/health` stays public.
+- **The API key** is on by default: `./bonsai` generates one, which stops other local processes and web pages from using
+  the model. The agent can still read it. To rotate it, delete `.state/api-key` and run `./bonsai restart`.
 - **`--no-webui --no-slots`** turn off the server's browser interface and its slot monitoring, which pi does not use. They
   are in the fork's current documentation, but have not been checked against the pinned release. If the server will not
   start, look in `.state/server.log`.

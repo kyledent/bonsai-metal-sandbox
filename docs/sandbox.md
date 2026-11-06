@@ -15,7 +15,7 @@ should be refused is.
 | **Writes** | The Metal caches, its log | Its home (`.state/home`), the workspace |
 | **Starts programs** | No | Yes, and they stay in the sandbox |
 | **Network** | Listens on one loopback port, connects nowhere | Set by `BONSAI_AGENT_NETWORK` |
-| **Environment** | Only what it needs | Only what it needs, plus `GH_TOKEN` and `BONSAI_API_KEY` if you set them |
+| **Environment** | Only what it needs, and its API key | Only what it needs, the server's API key, and `GH_TOKEN` if you set it |
 
 The agent cannot read or change your home folder, other volumes, `/tmp`, this repository's `.env`, pi's install, or the
 sandbox profiles. Its profile also leaves out the services for the keychain, the clipboard and `open`, which would start
@@ -49,7 +49,9 @@ BONSAI_AGENT_NETWORK=open ./bonsai
 - **It is one layer.** It does not protect against a kernel bug, or a flaw in a system service the profile allows.
 - **The server's `iokit-open` is broad.** It is not narrowed to named GPU clients, because the names differ between GPU
   generations.
-- **Any local process can reach the server's port.** Set `BONSAI_API_KEY` if that matters on your Mac.
+- **Any local process can reach the server's port, and llama-server accepts requests from any web page.** So the server
+  always has an API key, which `./bonsai` generates on first run. Only status endpoints, such as `/health`, answer without it. A server started
+  before this change has none until `./bonsai restart`, and `./bonsai doctor` checks for this.
 - **Some allowed services may leak.** The default network refuses connections, but the agent can still use the system's DNS
   resolver, which may carry data out. See [Hardening](hardening.md#close-the-gaps-in-the-profiles) for this and other gaps.
 

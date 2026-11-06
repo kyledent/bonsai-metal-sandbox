@@ -21,9 +21,17 @@ def main():
         print("Available devices:\n  MTL0: Apple M4 Pro (mock)")
         return
 
+    key = os.environ.get("LLAMA_API_KEY")  # as llama-server: every endpoint but /health needs it, when set
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
+
+        def refused(self):
+            if not key or self.headers.get("Authorization") == f"Bearer {key}":
+                return False
+            self.send_error(401)
+            return True
 
         def send_json(self, value):
             body = json.dumps(value).encode()
@@ -36,6 +44,8 @@ def main():
         def do_GET(self):
             if self.path == "/health":
                 self.send_json({"status": "ok"})
+            elif self.refused():
+                pass
             elif self.path == "/props":
                 self.send_json({
                     "model_alias": args.alias,
@@ -49,6 +59,8 @@ def main():
 
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.refused():
+                return
             if args.record:
                 with open(args.record, "a", encoding="utf-8") as f:
                     f.write(json.dumps(request) + "\n")

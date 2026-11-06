@@ -21,7 +21,7 @@ server reports:
     "bonsai-8080": {
       "baseUrl": "http://127.0.0.1:8080/v1",
       "api": "openai-completions",
-      "apiKey": "none",
+      "apiKey": "BONSAI_API_KEY",
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
@@ -41,6 +41,8 @@ server reports:
   }
 }
 ```
+
+`apiKey` names an environment variable, which pi reads, so the key itself is not written to the file.
 
 Providers whose names start with `bonsai` belong to the script, and each run replaces them. Your other providers are
 kept. If you start a server while pi is open, run `./bonsai detect` in a second terminal, then open `/model`.

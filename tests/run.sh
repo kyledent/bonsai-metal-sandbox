@@ -63,7 +63,7 @@ done
 echo \"exec \$*\" >> \"\$log\"
 echo \"cwd \$(pwd -P)\" >> \"\$log\"
 exec \"\$@\""
-stub ps "tr '\\0' ' ' < /proc/\$2/cmdline 2>/dev/null; echo llama-server"
+stub ps "kill -0 \"\$2\" 2>/dev/null || exit 1; echo '$(pwd -P)/.runtime/llama/prism-b10828-a153697/llama-server'"
 # The agent's PATH holds jq's folder, so these two reach it wherever this machine keeps them (jq.exe: without its CRs)
 stub curl "exec '$(command -v curl)' \"\$@\""
 stub jq "set -o pipefail; '$(command -v jq)' \"\$@\" | tr -d '\\r'"
@@ -91,6 +91,9 @@ check "server starts in its own folder, not this repository" contains "$WORK/san
 check "server command has the Prism flags" contains "$WORK/sandbox.log" \
     "exec .*llama-server -m .*PQ2_0.gguf --host 127.0.0.1 --port $PORT --alias bonsai2-27b-pq2-0 -ngl 99 -fa on -c 32768 --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 --jinja --reasoning-format deepseek --reasoning-budget 2048 --parallel 1 --cache-ram 8192"
 check "./bonsai status reports it" sh -c './bonsai status | grep -q "ready: bonsai2-27b-pq2-0"'
+check "a key is generated and kept out of the agent's reach" test -s .state/api-key
+http_code() { curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST -H 'Content-Type: application/json' -d '{}' "$@"; }
+check "the server refuses requests without the key" test "$(http_code "http://127.0.0.1:$PORT/v1/chat/completions")" = 401
 
 # --- Detection, in the agent's sandbox wrapper
 "$PYTHON" -I "$SRC/tests/mock_llama.py" --port "$OTHER_PORT" --alias qwen-other &
@@ -196,8 +199,16 @@ check "9B on 128 GB: the top tier is the 27B's only" contains "$WORK/sandbox.log
 check "restart the 27B on 128 GB" env BONSAI_MODEL=27B ./bonsai restart
 check "27B on 128 GB: the top tier" contains "$WORK/sandbox.log" 'exec .* -c 131072 '
 
+# --- One of ours whose pid file is gone: found by its port
+ORPHAN=$(cat .state/server.pid)
+rm -f .state/server.pid .state/server.model
+stub lsof "echo $ORPHAN"
+check "a server without its pid file is found by its port" sh -c "./bonsai status | grep -q 'running, pid $ORPHAN'"
+check "its model is unknown, so another preset is refused" sh -c '! BONSAI_MODEL=9B ./bonsai up 2>/dev/null'
+
 # --- Restart and stop
 check "./bonsai down stops it" ./bonsai down
+rm -f "$WORK/stubs/lsof"
 check "./bonsai down twice is fine" ./bonsai down
 check "no server answers after down" sh -c "! curl -fsS -m 2 http://127.0.0.1:$PORT/health >/dev/null 2>&1"
 rm -f "$WORK/stubs/sandbox-exec"

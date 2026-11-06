@@ -71,6 +71,19 @@ load_preset() {
     esac
 }
 
+# The server lets any web page call it (CORS allows every origin), so it always has a key: BONSAI_API_KEY, or one
+# generated once and kept in .state, which the agent's sandbox cannot read. The agent gets it in its environment.
+api_key_default() {
+    local file="$STATE/api-key"
+    [ -z "${BONSAI_API_KEY:-}" ] || return 0
+    if [ ! -s "$file" ]; then
+        mkdir -p "$STATE"
+        ( umask 077; od -An -tx1 -N24 /dev/urandom | tr -d ' \n' > "$file" )
+    fi
+    BONSAI_API_KEY=$(cat "$file")
+    export BONSAI_API_KEY
+}
+
 # A relative path in .env is relative to this folder
 abs_path() {
     case "$1" in /*) echo "$1" ;; *) echo "$ROOT/${1#./}" ;; esac
@@ -79,6 +92,7 @@ abs_path() {
 load_config() {
     SHELL_MODEL=$(echo "${BONSAI_MODEL:-}" | tr 'a-z' 'A-Z')   # asked for on this command line, unlike one in .env
     load_env
+    api_key_default
     PRESET=$(echo "${BONSAI_MODEL:-27B}" | tr 'a-z' 'A-Z')
     QUANT="${BONSAI_QUANT:-PQ2_0}"
     load_preset "$PRESET"
@@ -212,7 +226,7 @@ server_sandbox() {
     mkdir -p "$MODEL_DIR"
     SERVER_SANDBOX=(env -i "PATH=/usr/bin:/bin" "HOME=$HOME" "TMPDIR=$temp/" "LANG=${LANG:-en_US.UTF-8}")
     # Not on the command line, where ps would show it
-    if [ -n "${BONSAI_API_KEY:-}" ]; then SERVER_SANDBOX+=("LLAMA_API_KEY=$BONSAI_API_KEY"); fi
+    SERVER_SANDBOX+=("LLAMA_API_KEY=$BONSAI_API_KEY")
     # Prism's workaround for an out-of-memory error on M5 with macOS 26.2 to 26.4
     if [ -n "${GGML_METAL_TENSOR_DISABLE:-}" ]; then SERVER_SANDBOX+=("GGML_METAL_TENSOR_DISABLE=$GGML_METAL_TENSOR_DISABLE"); fi
     SERVER_SANDBOX+=("$SANDBOX_EXEC" -f "$ROOT/sandbox/server.sb"
@@ -222,14 +236,28 @@ server_sandbox() {
 
 server_pid() {
     local pid
-    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
-    case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
-        *llama-server*) echo "$pid" ;;
-        *) rm -f "$PID_FILE"; return 1 ;;
+    if pid=$(cat "$PID_FILE" 2>/dev/null); then
+        case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
+            *llama-server*) echo "$pid"; return 0 ;;
+        esac
+        rm -f "$PID_FILE"
+    fi
+    # One of ours whose pid file is gone: found by its port, so that down and restart can still stop it. Its model is
+    # unknown, so asking for a preset on the command line makes up stop and say to restart.
+    pid=$(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1) || return 1
+    case "$(ps -p "${pid:-0}" -o command= 2>/dev/null || true)" in
+        "$RUNTIME/llama/"*llama-server*) echo "$pid" > "$PID_FILE"; rm -f "$MODEL_MARKER"; echo "$pid" ;;
+        *) return 1 ;;
     esac
 }
 
 server_healthy() { curl -fsS --connect-timeout 1 -m 3 "$BASE_URL/health" >/dev/null 2>&1; }
+
+# An empty request without the key: 401 when the server enforces it, 400 when it has none
+server_wants_key() {
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST -H 'Content-Type: application/json' -d '{}' \
+        "$BASE_URL/v1/chat/completions" 2>/dev/null)" = 401 ]
+}
 
 cmd_up() {
     require_setup
@@ -349,7 +377,7 @@ cmd_status() {
     local pid
     if pid=$(server_pid); then echo "server: running, pid $pid, port $PORT"; else echo "server: not started by ./bonsai"; fi
     if server_healthy; then
-        curl -fsS -m 3 "$BASE_URL/props" 2>/dev/null \
+        curl -fsS -m 3 -H "Authorization: Bearer $BONSAI_API_KEY" "$BASE_URL/props" 2>/dev/null \
             | jq -r '"ready: \(.model_alias // "?"), ctx \(.default_generation_settings.n_ctx // "?")"' 2>/dev/null \
             || echo "ready"
     else
@@ -376,17 +404,18 @@ lists_metal() {
     echo "$devices" | grep -qiE 'metal|mtl'
 }
 
-# The server's last start, from its log: llama.cpp reports how many layers went to the GPU, and falls back to the CPU
-# when the sandbox hides Metal
+# The server's last start, from its log. llama-server warns when it finds no GPU and falls back to the CPU. At its
+# default log level, the pinned release does not say where the layers went, so that line is only there with -lv 4.
 check_server_log() {
     local line n on total
     if [ ! -s "$LOG_FILE" ]; then
         echo "  skip  server log: start the server with ./bonsai up, then run doctor again"
         return
     fi
+    expect_refused "the server's last start found a GPU" grep -q 'no usable GPU' "$LOG_FILE"
     line=$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' "$LOG_FILE" | tail -n 1 || true)
     if [ -z "$line" ]; then
-        echo "  skip  server log: it has not loaded the model yet, or does not say where the layers went"
+        echo "  skip  server log: it does not say where the layers went. Watch % GPU in Activity Monitor instead"
         return
     fi
     n=${line#offloaded }; n=${n%% *}; on=${n%/*}; total=${n#*/}
@@ -438,6 +467,8 @@ cmd_doctor() {
     fi
     if server_healthy; then
         expect_ok "it can reach the server" agent_run /usr/bin/curl -fsS -m 3 -o /dev/null "$BASE_URL/health"
+        expect_ok "the server refuses requests without its key" server_wants_key
+        if ! server_wants_key; then echo "        it was started without one: run ./bonsai restart"; fi
     else
         echo "  skip  server check: start it with ./bonsai up, then run doctor again"
     fi
