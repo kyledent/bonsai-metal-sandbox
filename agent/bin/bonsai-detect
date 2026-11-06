@@ -88,7 +88,8 @@ done
 
 # models.json: drop the old bonsai* providers, add the ones found now
 [ -s "$models" ] || echo '{"providers": {}}' > "$models"
-tmp=$(mktemp)
+# Next to the files it replaces, not mktemp's, which fails in the sandbox
+tmp="$agent_dir/.bonsai-detect.$$"
 jq --argjson found "$found" '
     .providers = ((.providers // {}) | with_entries(select(.key | startswith("bonsai") | not))) + $found
 ' "$models" > "$tmp" && mv "$tmp" "$models"

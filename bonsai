@@ -375,6 +375,27 @@ lists_metal() {
     echo "$devices" | grep -qiE 'metal|mtl'
 }
 
+# The server's last start, from its log: llama.cpp reports how many layers went to the GPU, and falls back to the CPU
+# when the sandbox hides Metal
+check_server_log() {
+    local line n on total
+    if [ ! -s "$LOG_FILE" ]; then
+        echo "  skip  server log: start the server with ./bonsai up, then run doctor again"
+        return
+    fi
+    line=$(grep -oE 'offloaded [0-9]+/[0-9]+ layers to GPU' "$LOG_FILE" | tail -n 1 || true)
+    if [ -z "$line" ]; then
+        echo "  skip  server log: it has not loaded the model yet, or does not say where the layers went"
+        return
+    fi
+    n=${line#offloaded }; n=${n%% *}; on=${n%/*}; total=${n#*/}
+    expect_ok "the server's last start put all its layers on the GPU ($on/$total)" [ "$on" = "$total" ]
+    if [ "$on" != "$total" ]; then
+        echo "        from $LOG_FILE:"
+        grep -iE 'metal|gpu|mtl' "$LOG_FILE" | tail -n 10 | sed 's/^/        /' || true
+    fi
+}
+
 cmd_doctor() {
     require_setup
     local canary="$HOME/.bonsai-doctor-canary" state_canary="$STATE/doctor-canary"
@@ -387,7 +408,12 @@ cmd_doctor() {
     echo "Server sandbox"
     expect_ok "llama-server sees Metal without a sandbox" lists_metal "$LLAMA_SERVER"
     expect_ok "llama-server sees Metal in the sandbox" lists_metal "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER"
+    if ! lists_metal "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER"; then
+        echo "        its output:"
+        "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" --list-devices 2>&1 | tail -n 15 | sed 's/^/        /' || true
+    fi
     expect_refused "it cannot start a shell" "${SERVER_SANDBOX[@]}" /bin/sh -c true
+    check_server_log
 
     echo "Agent sandbox (network: $NETWORK)"
     expect_ok "it can run a program at all" agent_run /usr/bin/true
