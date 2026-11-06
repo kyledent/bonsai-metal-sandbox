@@ -1,0 +1,464 @@
+#!/bin/bash
+# Serve Ternary Bonsai 2 27B on Apple Silicon and use it from the pi coding agent, both under macOS sandboxes.
+#
+#   ./bonsai           set up if needed, start the server, open pi in this terminal
+#   ./bonsai doctor    prove that the sandboxes allow and refuse what they should
+#
+# Written for the bash 3.2 that macOS ships.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+STATE="$ROOT/.state"
+RUNTIME="$ROOT/.runtime"
+AGENT_HOME="$STATE/home"
+PID_FILE="$STATE/server.pid"
+LOG_FILE="$STATE/server.log"
+
+# The fork's release that Bonsai-demo's download_binaries.sh uses. Stock llama.cpp cannot run these files.
+LLAMA_TAG=prism-b10828-a153697
+LLAMA_ASSET="llama-$LLAMA_TAG-bin-macos-arm64.tar.gz"
+LLAMA_URL="https://github.com/PrismML-Eng/llama.cpp/releases/download/$LLAMA_TAG/$LLAMA_ASSET"
+LLAMA_SHA256=5c6238a1e7d5c2540ad3d47438388df198433981074290e9397eb4db3d786135
+LLAMA_DIR="$RUNTIME/llama/$LLAMA_TAG"
+LLAMA_SERVER="$LLAMA_DIR/llama-server"
+
+PRESETS="2B 9B 27B"
+MODEL_MARKER="$STATE/server.model"
+
+PI_PACKAGE=@mariozechner/pi-coding-agent
+
+die() { echo "bonsai: $*" >&2; exit 1; }
+
+# .env, as "docker compose" reads it: literal values, and the shell's environment wins
+load_env() {
+    local line key val
+    [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env"; echo "Created .env from .env.example"; }
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case "$line" in ''|\#*) continue ;; esac
+        key=${line%%=*}; val=${line#*=}
+        case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+        if [ -z "${!key+x}" ]; then export "$key=$val"; fi
+    done < "$ROOT/.env"
+}
+
+# A preset: one size of Bonsai 2, with every file pinned by commit and checksum. Sets the variables that name its files.
+load_preset() {
+    local size=$1
+    HF_REPO="prism-ml/Ternary-Bonsai-2-$size-gguf"
+    MODEL_FILE="Ternary-Bonsai-2-$size-$QUANT.gguf"
+    MMPROJ_FILE="Ternary-Bonsai-2-$size-mmproj-Q8_0.gguf"
+    case "$size" in
+        2B)
+            HF_REVISION=683f7be2629342a50987627b40881e54761a2430
+            MMPROJ_SHA256=ac9934e8d7966d0d62442c202ec8fdad99a045dea79366c1a4a246a46f5c0533; MMPROJ_SIZE=364664352 ;;
+        9B)
+            HF_REVISION=5b2abb02362efbed46bbe204014b02837778b2c2
+            MMPROJ_SHA256=e0cb6f6988cea323ef798cd77d019bbb819af75582f034eaab0e7232314953db; MMPROJ_SIZE=624229664 ;;
+        27B)
+            HF_REVISION=b072e1d3b35a0a630cece372c2127528e0994386
+            MMPROJ_SHA256=6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903; MMPROJ_SIZE=629246976 ;;
+        *) die "BONSAI_MODEL must be 2B, 9B or 27B, not $size" ;;
+    esac
+    case "$size-$QUANT" in
+        2B-PQ2_0)   MODEL_SHA256=d5f01a4ecaf49239653308ee732ad1a0c5f802c0ddb997549fc7b694c8b45928; MODEL_SIZE=517312992 ;;
+        2B-PTQ1_0)  MODEL_SHA256=36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa; MODEL_SIZE=429183456 ;;
+        9B-PQ2_0)   MODEL_SHA256=7a89ab48f5038c704480f60781f9b8d4035351f5f6beb7d11fad80001fde23f9; MODEL_SIZE=2416851840 ;;
+        9B-PTQ1_0)  MODEL_SHA256=3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b; MODEL_SIZE=1997486976 ;;
+        27B-PQ2_0)  MODEL_SHA256=3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1; MODEL_SIZE=7206168928 ;;
+        27B-PTQ1_0) MODEL_SHA256=53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3; MODEL_SIZE=5946648928 ;;
+        *) die "BONSAI_QUANT must be PQ2_0 or PTQ1_0, not $QUANT" ;;
+    esac
+}
+
+# A relative path in .env is relative to this folder
+abs_path() {
+    case "$1" in /*) echo "$1" ;; *) echo "$ROOT/${1#./}" ;; esac
+}
+
+load_config() {
+    SHELL_MODEL=$(echo "${BONSAI_MODEL:-}" | tr 'a-z' 'A-Z')   # asked for on this command line, unlike one in .env
+    load_env
+    PRESET=$(echo "${BONSAI_MODEL:-27B}" | tr 'a-z' 'A-Z')
+    QUANT="${BONSAI_QUANT:-PQ2_0}"
+    load_preset "$PRESET"
+    MODEL_DIR=$(abs_path "${BONSAI_MODEL_DIR:-./models}")
+    VISION="${BONSAI_VISION:-0}"
+    WORKSPACE=$(abs_path "${WORKSPACE_DIR:-./workspace}")
+    PORTS="${BONSAI_PORTS:-8080-8083}"
+    PORT=$(expand_ports "$PORTS" | head -n 1)
+    NETWORK="${BONSAI_AGENT_NETWORK:-server}"
+    case "$NETWORK" in server|loopback|open) ;; *) die "BONSAI_AGENT_NETWORK must be server, loopback or open, not $NETWORK" ;; esac
+    PI_VERSION="${PI_VERSION:-0.73.1}"
+    PI_DIR="$RUNTIME/pi"
+    BASE_URL="http://127.0.0.1:$PORT"
+    SANDBOX_EXEC=$(command -v sandbox-exec) || die "sandbox-exec not found: this needs macOS"
+}
+
+# "8080-8083 8100" -> 8080 8081 8082 8083 8100
+expand_ports() {
+    local p
+    for p in ${1//,/ }; do
+        case "$p" in
+            *[!0-9-]*|'') die "bad port in BONSAI_PORTS: $p" ;;
+            *-*) seq "${p%-*}" "${p#*-}" ;;
+            *) echo "$p" ;;
+        esac
+    done
+}
+
+mem_gb() { echo $(( $(sysctl -n hw.memsize) / 1073741824 )); }
+
+# Bonsai-demo's RAM tiers, the same for each size. Its comment: about 64 KiB of KV cache per token on the 27B, and the
+# top tier is for the 27B only.
+ctx_default() {
+    if [ -n "${BONSAI_CTX:-}" ] && [ "$BONSAI_CTX" != 0 ]; then echo "$BONSAI_CTX"; return; fi
+    local gb; gb=$(mem_gb)
+    if [ "$gb" -le 11 ]; then echo 8192
+    elif [ "$gb" -le 23 ]; then echo 16384
+    elif [ "$gb" -le 35 ]; then echo 32768
+    elif [ "$gb" -le 71 ] || [ "$PRESET" != 27B ]; then echo 65536
+    else echo 131072; fi
+}
+
+# Prism's single-user advice is --cache-ram 24576, which is too much for a small Mac: at most a quarter of the RAM
+cache_ram_default() {
+    if [ -n "${BONSAI_CACHE_RAM:-}" ]; then echo "$BONSAI_CACHE_RAM"; return; fi
+    local mib=$(( $(mem_gb) * 1024 / 4 ))
+    if [ "$mib" -gt 24576 ]; then echo 24576; else echo "$mib"; fi
+}
+
+# Each model card's sampling for thinking mode. Its profile for thinking off is per request, in bonsai-thinking.ts.
+sampling_args() {
+    case "$PRESET" in
+        27B) echo --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.05 ;;
+        *)   echo --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.0 --repeat-penalty 1.0 --repeat-last-n 64 ;;
+    esac
+}
+
+# The budget of requests that set none. pi's compaction summaries are such requests, with 80% of the reserve (a quarter
+# of the context, at most 24K) as their max output, so thinking must leave room for the summary: a sixteenth of the context
+reasoning_budget_default() {
+    if [ -n "${BONSAI_REASONING_BUDGET:-}" ]; then echo "$BONSAI_REASONING_BUDGET"; return; fi
+    echo $(( $(ctx_default) / 16 ))
+}
+
+# download URL DEST SHA256 SIZE: resumable, and DEST appears only after the checksum passes
+download() {
+    local url=$1 dest=$2 sha=$3 size=$4 part="$2.part" got
+    if [ -f "$dest" ]; then
+        [ "$(wc -c < "$dest" | tr -d ' ')" = "$size" ] || die "$dest has the wrong size; delete it and run setup again"
+        return 0
+    fi
+    mkdir -p "$(dirname "$dest")"
+    if [ ! -f "$part" ] || [ "$(wc -c < "$part" | tr -d ' ')" != "$size" ]; then
+        echo "Downloading $(basename "$dest") ($(( size / 1048576 )) MiB)"
+        curl -fL --retry 3 -C - -o "$part" "$url"
+    fi
+    got=$(shasum -a 256 "$part" | cut -d ' ' -f 1)
+    if [ "$got" != "$sha" ]; then
+        rm -f "$part"
+        die "checksum mismatch for $(basename "$dest"): expected $sha, got $got"
+    fi
+    mv "$part" "$dest"
+}
+
+cmd_setup() {
+    [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "this needs macOS on Apple Silicon"
+    local tool
+    for tool in curl tar shasum jq node npm; do
+        command -v "$tool" >/dev/null || die "$tool not found (brew install $tool; node brings npm)"
+    done
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>20||(a===20&&b>=6)?0:1)' \
+        || die "pi needs node 20.6 or newer, found $(node --version)"
+
+    if [ ! -x "$LLAMA_SERVER" ]; then
+        local tarball="$RUNTIME/$LLAMA_ASSET"
+        download "$LLAMA_URL" "$tarball" "$LLAMA_SHA256" 11586729
+        rm -rf "$LLAMA_DIR"; mkdir -p "$LLAMA_DIR"
+        tar -xzf "$tarball" -C "$LLAMA_DIR" --strip-components=1
+        [ -x "$LLAMA_SERVER" ] || die "no llama-server in $LLAMA_ASSET"
+    fi
+
+    download "https://huggingface.co/$HF_REPO/resolve/$HF_REVISION/$MODEL_FILE" \
+        "$MODEL_DIR/$MODEL_FILE" "$MODEL_SHA256" "$MODEL_SIZE"
+    if [ "$VISION" = 1 ]; then
+        download "https://huggingface.co/$HF_REPO/resolve/$HF_REVISION/$MMPROJ_FILE" \
+            "$MODEL_DIR/$MMPROJ_FILE" "$MMPROJ_SHA256" "$MMPROJ_SIZE"
+    fi
+
+    # Install scripts would run outside the sandbox, so they are not run
+    if [ "$(cat "$PI_DIR/.version" 2>/dev/null || true)" != "$PI_VERSION" ]; then
+        echo "Installing pi $PI_VERSION"
+        rm -rf "$PI_DIR"
+        npm install -g --no-fund --no-audit --ignore-scripts --prefix "$PI_DIR" "$PI_PACKAGE@$PI_VERSION"
+        echo "$PI_VERSION" > "$PI_DIR/.version"
+    fi
+}
+
+require_setup() {
+    if [ ! -x "$LLAMA_SERVER" ] || [ ! -f "$MODEL_DIR/$MODEL_FILE" ] || [ ! -x "$PI_DIR/bin/pi" ] \
+        || { [ "$VISION" = 1 ] && [ ! -f "$MODEL_DIR/$MMPROJ_FILE" ]; }; then
+        cmd_setup
+    fi
+    mkdir -p "$STATE" "$WORKSPACE"
+}
+
+# Sets SERVER_SANDBOX to the command line that runs a program in the server's sandbox, with a clean environment
+server_sandbox() {
+    local cache temp
+    cache=$(cd "$(getconf DARWIN_USER_CACHE_DIR)" && pwd -P)
+    temp=$(cd "$(getconf DARWIN_USER_TEMP_DIR)" && pwd -P)
+    mkdir -p "$MODEL_DIR"
+    SERVER_SANDBOX=(env -i "PATH=/usr/bin:/bin" "HOME=$HOME" "TMPDIR=$temp/" "LANG=${LANG:-en_US.UTF-8}")
+    # Not on the command line, where ps would show it
+    if [ -n "${BONSAI_API_KEY:-}" ]; then SERVER_SANDBOX+=("LLAMA_API_KEY=$BONSAI_API_KEY"); fi
+    # Prism's workaround for an out-of-memory error on M5 with macOS 26.2 to 26.4
+    if [ -n "${GGML_METAL_TENSOR_DISABLE:-}" ]; then SERVER_SANDBOX+=("GGML_METAL_TENSOR_DISABLE=$GGML_METAL_TENSOR_DISABLE"); fi
+    SERVER_SANDBOX+=("$SANDBOX_EXEC" -f "$ROOT/sandbox/server.sb"
+        -D "BIN=$LLAMA_SERVER" -D "BIN_DIR=$LLAMA_DIR" -D "MODEL_DIR=$(cd "$MODEL_DIR" && pwd -P)" -D "PORT=$PORT"
+        -D "CACHE_DIR=$cache" -D "TEMP_DIR=$temp" -D "LOG_FILE=$LOG_FILE")
+}
+
+server_pid() {
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null) || return 1
+    case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
+        *llama-server*) echo "$pid" ;;
+        *) rm -f "$PID_FILE"; return 1 ;;
+    esac
+}
+
+server_healthy() { curl -fsS --connect-timeout 1 -m 3 "$BASE_URL/health" >/dev/null 2>&1; }
+
+cmd_up() {
+    require_setup
+    if server_pid >/dev/null; then
+        local running wanted="$PRESET-$QUANT"
+        running=$(cat "$MODEL_MARKER" 2>/dev/null || echo unknown)
+        if [ "$running" = "$wanted" ]; then
+            echo "Server already running on port $PORT"
+        elif [ -n "$SHELL_MODEL" ]; then
+            die "the server is running $running, not $wanted. To switch: BONSAI_MODEL=$PRESET ./bonsai restart"
+        else
+            echo "Server already running $running on port $PORT (.env says $wanted; ./bonsai restart switches to it)"
+        fi
+    elif server_healthy; then
+        echo "Something else already serves port $PORT; using it"
+        return 0
+    else
+        local args
+        # shellcheck disable=SC2207  # split into words on purpose
+        args=(-m "$MODEL_DIR/$MODEL_FILE" --host 127.0.0.1 --port "$PORT"
+            --alias "bonsai2-$(echo "$PRESET-$QUANT" | tr 'A-Z_' 'a-z-')"
+            -ngl 99 -fa on -c "$(ctx_default)"
+            $(sampling_args)
+            --jinja --reasoning-format deepseek --reasoning-budget "$(reasoning_budget_default)"
+            --parallel 1 --cache-ram "$(cache_ram_default)")
+        if [ "$VISION" = 1 ]; then args+=(--mmproj "$MODEL_DIR/$MMPROJ_FILE" --image-max-tokens 1024); fi
+        # shellcheck disable=SC2206  # split into words on purpose
+        args+=(${BONSAI_SERVER_ARGS:-})
+        server_sandbox
+        nohup "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER" "${args[@]}" > "$LOG_FILE" 2>&1 < /dev/null &
+        echo $! > "$PID_FILE"
+        echo "$PRESET-$QUANT" > "$MODEL_MARKER"
+        echo "Starting the $PRESET server on port $PORT (log: $LOG_FILE)"
+    fi
+    local waited=0 limit="${BONSAI_START_TIMEOUT:-300}"
+    until server_healthy; do
+        if ! server_pid >/dev/null; then
+            tail -n 20 "$LOG_FILE" >&2 || true
+            die "the server stopped while loading. Run ./bonsai doctor to check the sandbox"
+        fi
+        if [ "$waited" -ge "$limit" ]; then die "the server is not ready after ${limit}s; see $LOG_FILE"; fi
+        sleep 1; waited=$(( waited + 1 ))
+    done
+}
+
+cmd_down() {
+    local pid n=0
+    if ! pid=$(server_pid); then echo "Server not running"; return 0; fi
+    kill "$pid"
+    while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 1; n=$(( n + 1 )); done
+    if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid"; fi
+    rm -f "$PID_FILE" "$MODEL_MARKER"
+    echo "Server stopped"
+}
+
+# The generated profile: sandbox/agent.sb, the network mode, the terminal in use
+render_agent_profile() {
+    local p t
+    cat "$ROOT/sandbox/agent.sb"
+    case "$NETWORK" in
+        server)
+            for p in $(expand_ports "$PORTS"); do
+                echo "(allow network-outbound (remote ip \"localhost:$p\"))"
+            done ;;
+        loopback)
+            echo '(allow network-bind network-inbound (local ip "localhost:*"))'
+            echo '(allow network-outbound (remote ip "localhost:*"))' ;;
+        open)
+            echo '(allow network-bind network-inbound (local ip "localhost:*"))'
+            echo '(allow network-outbound)' ;;
+    esac
+    if t=$(tty 2>/dev/null); then
+        echo "(allow file-read* file-write* file-ioctl (literal \"$t\"))"
+    fi
+}
+
+# agent_run CMD...: run a program in the agent's sandbox, with a clean environment, in the workspace
+agent_run() {
+    local node_bin node_dir node_prefix jq_dir var
+    node_bin=$(node -p 'process.execPath')
+    node_dir=$(dirname "$(command -v node)")
+    node_prefix=$(dirname "$(dirname "$node_bin")")
+    jq_dir=$(dirname "$(command -v jq)")
+    mkdir -p "$AGENT_HOME/tmp" "$WORKSPACE" "$STATE"
+    render_agent_profile > "$STATE/agent.sb"
+    local env_args=("HOME=$AGENT_HOME" "TMPDIR=$AGENT_HOME/tmp"
+        "PATH=$ROOT/agent/bin:$AGENT_HOME/.local/bin:$node_dir:$jq_dir:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        "BONSAI_PI_BIN=$PI_DIR/bin/pi" "BONSAI_AGENT_DIR=$ROOT/agent" "BONSAI_PORTS=$PORTS"
+        "USER=${USER:-dev}" "TERM=${TERM:-xterm-256color}" "LANG=${LANG:-en_US.UTF-8}")
+    # What pi and the detection read, and nothing else of the calling shell's: its secrets stay out
+    for var in BONSAI_THINKING BONSAI_THINKING_LEVELS BONSAI_MAX_OUTPUT BONSAI_API_KEY GH_TOKEN TZ COLORTERM TERM_PROGRAM; do
+        if [ -n "${!var:-}" ]; then env_args+=("$var=${!var}"); fi
+    done
+    (
+        cd "$WORKSPACE"
+        exec env -i "${env_args[@]}" "$SANDBOX_EXEC" -f "$STATE/agent.sb" \
+            -D "AGENT_HOME=$AGENT_HOME" -D "WORKSPACE=$(pwd -P)" -D "PI_DIR=$PI_DIR" \
+            -D "AGENT_DIR=$ROOT/agent" -D "NODE_PREFIX=$node_prefix" "$@"
+    )
+}
+
+cmd_models() {
+    local size selected state
+    selected=$PRESET
+    printf '  %-6s %-9s %-11s %s\n' PRESET WEIGHTS VISION FILE
+    for size in $PRESETS; do
+        load_preset "$size"
+        state="not downloaded"
+        if [ -f "$MODEL_DIR/$MODEL_FILE" ]; then state=downloaded; fi
+        if [ "$size" = "$selected" ]; then state="$state, selected"; fi
+        printf '  %-6s %-9s %-11s %s (%s)\n' "$size" "$(( MODEL_SIZE / 1000000 )) MB" "$(( MMPROJ_SIZE / 1000000 )) MB" "$MODEL_FILE" "$state"
+    done
+}
+
+cmd_status() {
+    local pid
+    if pid=$(server_pid); then echo "server: running, pid $pid, port $PORT"; else echo "server: not started by ./bonsai"; fi
+    if server_healthy; then
+        curl -fsS -m 3 "$BASE_URL/props" 2>/dev/null \
+            | jq -r '"ready: \(.model_alias // "?"), ctx \(.default_generation_settings.n_ctx // "?")"' 2>/dev/null \
+            || echo "ready"
+    else
+        echo "port $PORT: no healthy server"
+    fi
+}
+
+DOCTOR_FAILS=0
+expect_ok() {
+    local label=$1; shift
+    if "$@" >/dev/null 2>&1; then echo "  ok    $label"
+    else echo "  FAIL  $label"; DOCTOR_FAILS=$(( DOCTOR_FAILS + 1 )); fi
+}
+expect_refused() {
+    local label=$1; shift
+    if "$@" >/dev/null 2>&1; then echo "  FAIL  $label (it was allowed)"; DOCTOR_FAILS=$(( DOCTOR_FAILS + 1 ))
+    else echo "  ok    $label"; fi
+}
+
+# Exit 0 if this llama-server command line reports a Metal device
+lists_metal() {
+    local devices
+    devices=$("$@" --list-devices 2>&1) || return 1
+    echo "$devices" | grep -qiE 'metal|mtl'
+}
+
+cmd_doctor() {
+    require_setup
+    local canary="$HOME/.bonsai-doctor-canary" state_canary="$STATE/doctor-canary"
+    local denied="$HOME/.bonsai-doctor-denied" probe="$WORKSPACE/.bonsai-doctor"
+    echo secret > "$canary"; echo secret > "$state_canary"; rm -f "$denied"
+    # shellcheck disable=SC2064  # expand now
+    trap "rm -f '$canary' '$state_canary' '$denied' '$probe'" EXIT
+
+    server_sandbox
+    echo "Server sandbox"
+    expect_ok "llama-server sees Metal without a sandbox" lists_metal "$LLAMA_SERVER"
+    expect_ok "llama-server sees Metal in the sandbox" lists_metal "${SERVER_SANDBOX[@]}" "$LLAMA_SERVER"
+    expect_refused "it cannot start a shell" "${SERVER_SANDBOX[@]}" /bin/sh -c true
+
+    echo "Agent sandbox (network: $NETWORK)"
+    expect_ok "it can run a program at all" agent_run /usr/bin/true
+    expect_ok "node runs" agent_run node --version
+    expect_ok "pi runs" agent_run "$PI_DIR/bin/pi" --version
+    expect_ok "git runs" agent_run git --version
+    expect_ok "it can write the workspace" agent_run /usr/bin/touch "$probe"
+    expect_ok "it can write its home" agent_run /usr/bin/touch "$AGENT_HOME/.doctor"
+    expect_refused "it cannot read your home ($canary)" agent_run /bin/cat "$canary"
+    expect_refused "it cannot write your home" agent_run /usr/bin/touch "$denied"
+    expect_refused "it cannot read this repo's .state and .env" agent_run /bin/cat "$state_canary"
+    expect_refused "it cannot change pi's install" agent_run /usr/bin/touch "$PI_DIR/.doctor"
+    expect_refused "it cannot change the sandbox profiles" agent_run /usr/bin/touch "$ROOT/sandbox/agent.sb"
+    if [ "$NETWORK" != open ]; then
+        if curl -fsS -m 5 -o /dev/null https://example.com 2>/dev/null; then
+            expect_refused "it cannot reach the internet" agent_run /usr/bin/curl -fsS -m 5 -o /dev/null https://example.com
+        else
+            echo "  skip  internet check: this Mac cannot reach example.com either"
+        fi
+    fi
+    if server_healthy; then
+        expect_ok "it can reach the server" agent_run /usr/bin/curl -fsS -m 3 -o /dev/null "$BASE_URL/health"
+    else
+        echo "  skip  server check: start it with ./bonsai up, then run doctor again"
+    fi
+
+    if [ "$DOCTOR_FAILS" -gt 0 ]; then
+        echo
+        echo "$DOCTOR_FAILS check(s) failed. The sandbox's refusals are in the system log:"
+        echo "  log show --last 5m --style compact --predicate 'sender == \"Sandbox\"' | grep -E 'llama-server|node|deny'"
+        return 1
+    fi
+    echo "All checks passed."
+}
+
+usage() {
+    cat <<'EOF'
+Usage: ./bonsai [command]
+  pi        set up if needed, start the server, open pi (the default); arguments go to pi
+  setup     check the tools, download llama.cpp's fork, the model and pi
+  models    list the presets (BONSAI_MODEL=2B, 9B or 27B)
+  up        start the server in the background and wait until it is ready
+  down      stop the server
+  restart   down, then up
+  detect    list the Bonsai servers that the agent's sandbox can see
+  shell     a shell in the agent's sandbox, in the workspace
+  logs      follow the server's log
+  status    what is running
+  doctor    check that the sandboxes allow and refuse what they should
+EOF
+}
+
+command=${1:-pi}
+[ $# -eq 0 ] || shift
+case "$command" in
+    -h|--help|help) usage; exit 0 ;;
+    pi|setup|models|up|down|restart|detect|shell|logs|status|doctor) ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+load_config
+case "$command" in
+    pi)      cmd_up; agent_run "$ROOT/agent/bin/pi" "$@" ;;
+    setup)   cmd_setup ;;
+    models)  cmd_models ;;
+    up)      cmd_up ;;
+    down)    cmd_down ;;
+    restart) cmd_down; cmd_up ;;
+    detect)  require_setup; agent_run "$ROOT/agent/bin/bonsai-detect" ;;
+    shell)   require_setup; agent_run /bin/bash ;;
+    logs)    tail -n 200 -f "$LOG_FILE" ;;
+    status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+esac

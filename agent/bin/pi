@@ -1,0 +1,4 @@
+#!/bin/bash
+# pi, with the Bonsai servers detected first (bonsai-detect writes them into models.json)
+"$BONSAI_AGENT_DIR/bin/bonsai-detect" --quiet || true
+exec "$BONSAI_PI_BIN" "$@"
